@@ -540,43 +540,45 @@ function persist(){
 }
 function pushToSheets(){
   if(!SCRIPT_URL) return;
-  // POST with no-cors: bypasses CORS entirely, works for any payload size
-  // We cannot read the response, so we schedule a pull 3s later to confirm
-  var body=JSON.stringify({purchases:purchases,cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_clientId:_clientId});
-  fetch(SCRIPT_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:body})
-    .then(function(){
-      _syncPending=false; _lastSync=Date.now();
-      setSyncStatus('saved');
-      setTimeout(function(){setSyncStatus('idle');},2500);
-    })
-    .catch(function(e){
-      // no-cors fetch errors are rare; try JSONP write as fallback
-      console.warn('POST failed, trying JSONP write:',e);
-      pushViaJsonp();
-    });
-}
-function pushViaJsonp(){
-  // Fallback: JSONP write (limited by URL length ~7KB)
-  var cbName='_elfWCb_'+Date.now();
-  var payload=JSON.stringify({purchases:purchases,cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands});
-  var enc=encodeURIComponent(payload);
-  if(enc.length>6500){
-    // Too large for URL; show error and ask user to re-deploy with POST support
-    setSyncStatus('error');
-    showToast('Data too large for URL sync. Re-deploy Code.gs (POST support required).','err');
-    return;
+  setSyncStatus('saving'); _syncPending=true;
+  var CHUNK=12;
+  var chunks=[];
+  for(var i=0;i<purchases.length;i+=CHUNK) chunks.push(purchases.slice(i,i+CHUNK));
+  var step=0;
+  function next(){
+    if(step<chunks.length){
+      jsonpWrite({purchases:chunks[step],_chunk:true},function(){ step++; next(); });
+    } else {
+      jsonpWrite({purchases:[],cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_mastersOnly:true},function(){
+        _syncPending=false; _lastSync=Date.now();
+        setSyncStatus('saved'); setTimeout(function(){setSyncStatus('idle');},2500);
+      });
+    }
   }
+  if(chunks.length===0){
+    jsonpWrite({purchases:[],cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands},function(){
+      _syncPending=false; _lastSync=Date.now();
+      setSyncStatus('saved'); setTimeout(function(){setSyncStatus('idle');},2500);
+    });
+  } else { next(); }
+}
+function jsonpWrite(data, onDone){
+  var cbName='_elfW_'+Date.now()+'_'+Math.random().toString(36).substr(2,4);
+  var enc=encodeURIComponent(JSON.stringify(data));
+  var url=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+enc+'&cb='+Date.now();
   var s=document.createElement('script');
   var done=false;
-  var timer=setTimeout(function(){ if(!done){done=true;setSyncStatus('error');try{document.head.removeChild(s);}catch(e){}} },12000);
-  window[cbName]=function(){
+  var timer=setTimeout(function(){
+    if(!done){done=true;setSyncStatus('error');showToast('Sync timed out','err');try{document.head.removeChild(s);}catch(e){}}
+  },15000);
+  window[cbName]=function(r){
     if(done)return; done=true; clearTimeout(timer);
     try{document.head.removeChild(s);}catch(e){}
-    _syncPending=false;_lastSync=Date.now();
-    setSyncStatus('saved'); setTimeout(function(){setSyncStatus('idle');},2500);
+    if(r&&r.error){setSyncStatus('error');showToast('Sync error: '+r.error,'err');}
+    else if(onDone) onDone(r);
   };
-  s.src=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+enc+'&cb='+Date.now();
-  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('error');}}
+  s.src=url;
+  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('error');showToast('Cannot reach Sheet. Check deployment.','err');}}
   document.head.appendChild(s);
 }
 function testConnection(){
@@ -618,9 +620,10 @@ function setSyncStatus(state){
 function applySheetData(d){
   if(d.purchases!==undefined){ purchases=mergeByID(purchases,d.purchases); ensureIds(); }
   if(d.cfg) cfg=Object.assign(cfg,d.cfg);
-  if(d.pCats) pCats=d.pCats;
-  if(d.pSubs) pSubs=d.pSubs;
-  if(d.pBrands) pBrands=d.pBrands;
+  // Union masters - never wipe local masters with empty sheet data
+  if(d.pCats&&d.pCats.length) pCats=clientUnionArr(pCats,d.pCats);
+  if(d.pSubs&&d.pSubs.length) pSubs=clientUnionObjs(pSubs,d.pSubs,function(a){return a.cat+'||'+a.sub;});
+  if(d.pBrands&&d.pBrands.length) pBrands=clientUnionObjs(pBrands,d.pBrands,function(a){return a.cat+'||'+a.sub+'||'+a.brand;});
   try{
     localStorage.setItem('elf_p',JSON.stringify(purchases));
     localStorage.setItem('elf_c',JSON.stringify(cfg));
@@ -628,7 +631,11 @@ function applySheetData(d){
     localStorage.setItem('elf_subs',JSON.stringify(pSubs));
     localStorage.setItem('elf_brands',JSON.stringify(pBrands));
   }catch(e){}
+  var mp=document.getElementById('page-master');
+  if(mp&&mp.classList.contains('active')) renderMasterTree();
 }
+function clientUnionArr(a,b){var r=a.slice();(b||[]).forEach(function(v){if(r.indexOf(v)<0)r.push(v);});return r;}
+function clientUnionObjs(a,b,kFn){var seen={},r=[];(a||[]).concat(b||[]).forEach(function(o){var k=kFn(o);if(!seen[k]){seen[k]=true;r.push(o);}});return r;}
 // JSONP callback for reading from Apps Script (avoids CORS)
 var _jsonpCb=null;
 function _elfCb(data){
@@ -757,6 +764,7 @@ function showTab(name, el){
 
 // ====== SETTINGS ======
 function saveSettings(){
+  var prevDate=cfg.openingDate;
   cfg.storeName = document.getElementById('sName').value;
   cfg.openingDate = document.getElementById('sOpen').value;
   cfg.defLead = parseInt(document.getElementById('sLead').value)||7;
@@ -775,7 +783,26 @@ function saveSettings(){
     }
     SCRIPT_URL=newUrl;
   }
+  // Recalculate purchase targets when opening date changes
+  if(cfg.openingDate && cfg.openingDate!==prevDate){
+    var changed=0;
+    purchases.forEach(function(p){
+      if(p._deleted) return;
+      var l=parseInt(p.leadTime)||0,g=parseInt(p.grn)||0,d=parseInt(p.display)||0;
+      if(l+g+d>0){
+        p.purchaseTarget=subDays(cfg.openingDate,l+g+d);
+        p.supplyDate=addDays(p.purchaseTarget,l);
+        p._modified=Date.now();
+        changed++;
+      }
+    });
+    if(changed>0) showToast('Opening date updated - '+changed+' targets recalculated');
+  }
   persist();
+  // Refresh dashboard, table and alerts immediately
+  refresh(); renderTable();
+  var ap=document.getElementById('page-alerts');
+  if(ap&&ap.classList.contains('active')) renderAlertsTab();
 }
 function loadSettingsUI(){
   document.getElementById('sName').value = cfg.storeName||'';
@@ -1658,28 +1685,32 @@ function confirmImport(mode,prevId){
   } else {
     purchases=mergeByID(purchases,pendingImport);
   }
-  purchases.forEach(function(p){
+  // Rebuild masters fully from all purchases
+  pCats=[]; pSubs=[]; pBrands=[];
+  purchases.filter(function(p){return !p._deleted;}).forEach(function(p){
     var c=(p.category||'').trim(),s=(p.subcat||'').trim(),b=(p.brand||'').trim();
-    if(c&&s&&b) ensureMaster(c,s,b); else if(c&&s) ensureMaster(c,s,null); else if(c) ensureMaster(c,null,null);
+    if(c) ensureMaster(c,s||null,b||null);
   });
   pendingImport=[];
-  // Save locally first
+  // Save locally
   try{
     localStorage.setItem('elf_p',JSON.stringify(purchases));
     localStorage.setItem('elf_cats',JSON.stringify(pCats));
     localStorage.setItem('elf_subs',JSON.stringify(pSubs));
     localStorage.setItem('elf_brands',JSON.stringify(pBrands));
   }catch(e){}
-  // Force immediate push to Sheets (bypass debounce timer)
+  // Force immediate push to Sheets
   clearTimeout(_syncTimer);
   _syncPending=true; setSyncStatus('saving');
   pushToSheets();
   refresh(); renderTable();
-  document.getElementById('pv1').innerHTML=''; document.getElementById('pv2').innerHTML='';
+  var mp=document.getElementById('page-master');
+  if(mp&&mp.classList.contains('active')) renderMasterTree();
+  document.getElementById('pv1').innerHTML='';
+  document.getElementById('pv2').innerHTML='';
   document.getElementById('upModal').classList.remove('open');
-  showToast('Imported '+purchases.length+' entries \u2014 syncing to Sheets...');
+  showToast('Imported '+purchases.length+' entries - syncing to Sheets...');
 }
-
 // ====== DRAG DROP ======
 function onDov(e,id){ e.preventDefault(); var el=document.getElementById(id); if(el) el.classList.add('drag'); }
 function onDol(id){ var el=document.getElementById(id); if(el) el.classList.remove('drag'); }
