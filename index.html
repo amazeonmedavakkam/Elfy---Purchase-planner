@@ -369,7 +369,7 @@ select option{background:#fff;color:var(--tx)}
       <div class="fg"><label>Alert Window (days before target)</label><input id="sAlert" type="number" value="7" min="1" oninput="saveSettings()"></div>
     </div>
   </div>
-  <div class="fg" style="margin-top:16px;max-width:620px"><label>Google Sheets Sync URL <span style="font-weight:400;text-transform:none;font-size:11px;color:#9a50c1">(Apps Script /exec URL - leave blank for local-only mode)</span></label><input type="text" id="sScriptUrl" class="tin" placeholder="https://script.google.com/macros/s/.../exec" style="font-size:12px" oninput="saveSettings()"><div style="margin-top:5px;font-size:11px;color:#5a2d80">When set, all changes sync to Google Sheets. All users with access to the same sheet see live data.</div></div><div style="margin-top:14px"><button class="btn bd2 bsm" onclick="clearData()">&#9888;&#65039; Master Reset</button></div>
+  <div class="fg" style="margin-top:16px;max-width:620px"><label>Google Sheets Sync URL <span style="font-weight:400;text-transform:none;font-size:11px;color:#9a50c1">(Apps Script /exec URL - leave blank for local-only mode)</span></label><div style="display:flex;gap:8px;align-items:center"><input type="text" id="sScriptUrl" class="tin" placeholder="https://script.google.com/macros/s/.../exec" style="font-size:12px;flex:1" oninput="saveSettings()"><button class="btn bg bsm" onclick="testConnection()" style="white-space:nowrap;flex-shrink:0">&#128268; Test Connection</button></div><div style="margin-top:5px;font-size:11px;color:#5a2d80">When set, all changes sync to Google Sheets. All users with access to the same sheet see live data.</div></div><div style="margin-top:14px"><button class="btn bd2 bsm" onclick="clearData()">&#9888;&#65039; Master Reset</button></div>
 </div>
 
 <!-- PURCHASE ADD/EDIT MODAL -->
@@ -540,15 +540,89 @@ function persist(){
 }
 function pushToSheets(){
   if(!SCRIPT_URL) return;
-  var payload=encodeURIComponent(JSON.stringify({purchases:purchases,cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_clientId:_clientId}));
-  fetch(SCRIPT_URL+'?action=write&data='+payload+'&cb='+Date.now())
-    .then(function(r){return r.json();})
-    .then(function(d){
-      _syncPending=false;_lastSync=Date.now();
-      setSyncStatus('saved');
-      setTimeout(function(){setSyncStatus('idle');},2500);
-    })
-    .catch(function(e){setSyncStatus('error');console.warn('Push error:',e);});
+  // Write via JSONP GET (same pattern as read, Apps Script handles it)
+  var cbName='_elfWriteCb';
+  var payload=encodeURIComponent(JSON.stringify({
+    purchases:purchases,cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_clientId:_clientId
+  }));
+  var url=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+payload+'&cb='+Date.now();
+  // If URL too long (>7000 chars), chunk via multiple requests
+  if(url.length>7000){
+    pushInChunks(); return;
+  }
+  var s=document.createElement('script');
+  var done=false;
+  var timer=setTimeout(function(){
+    if(!done){done=true;setSyncStatus('error');try{document.head.removeChild(s);}catch(e){}}
+  },15000);
+  window[cbName]=function(d){
+    if(done) return; done=true;
+    clearTimeout(timer);
+    try{document.head.removeChild(s);}catch(e){}
+    _syncPending=false;_lastSync=Date.now();
+    setSyncStatus('saved');
+    setTimeout(function(){setSyncStatus('idle');},2500);
+  };
+  s.src=url;
+  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('error');}}
+  document.head.appendChild(s);
+}
+function pushInChunks(){
+  // For large datasets: send purchases in chunks, then send masters
+  var chunkSize=50;
+  var chunks=[];
+  for(var i=0;i<purchases.length;i+=chunkSize){
+    chunks.push(purchases.slice(i,i+chunkSize));
+  }
+  var idx=0;
+  function sendNext(){
+    if(idx>=chunks.length){
+      // All chunks sent, now send masters
+      var cbName='_elfChunkFinal';
+      var payload=encodeURIComponent(JSON.stringify({
+        cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_clientId:_clientId,_chunksOnly:true
+      }));
+      var s=document.createElement('script');
+      window[cbName]=function(){_syncPending=false;_lastSync=Date.now();setSyncStatus('saved');setTimeout(function(){setSyncStatus('idle');},2500);};
+      s.src=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+payload+'&cb='+Date.now();
+      document.head.appendChild(s);
+      return;
+    }
+    var cbName='_elfChunk'+idx;
+    var payload=encodeURIComponent(JSON.stringify({purchases:chunks[idx],_chunk:true,_clientId:_clientId}));
+    var s=document.createElement('script');
+    window[cbName]=function(){idx++;sendNext();};
+    s.src=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+payload+'&cb='+Date.now();
+    document.head.appendChild(s);
+  }
+  sendNext();
+}
+function testConnection(){
+  var inp=document.getElementById('sScriptUrl');
+  var url=(inp?inp.value.trim():SCRIPT_URL).trim();
+  if(!url){ showToast('Paste your Apps Script URL first','err'); return; }
+  SCRIPT_URL=url; inp.value=url;
+  setSyncStatus('loading');
+  var s=document.createElement('script'), done=false;
+  var cb='_testCb_'+Date.now();
+  var timer=setTimeout(function(){
+    if(!done){done=true; try{document.head.removeChild(s);}catch(e){}
+    setSyncStatus('error'); showToast('Connection timed out. Check URL & deployment.','err');}
+  },12000);
+  window[cb]=function(d){
+    if(done) return; done=true; clearTimeout(timer);
+    try{document.head.removeChild(s);}catch(e){}
+    if(d && !d.error){
+      setSyncStatus('saved'); showToast('Connected! Syncing data...');
+      persist(); setTimeout(pullFromSheets,300);
+    } else {
+      setSyncStatus('error');
+      showToast('Error: '+(d.error||'Unknown error')+'. Re-deploy script as Anyone.','err');
+    }
+  };
+  s.src=url+'?action=read&callback='+cb+'&cb='+Date.now();
+  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('error');showToast('Cannot reach script. Check URL.','err');}}
+  document.head.appendChild(s);
 }
 function setSyncStatus(state){
   var el=document.getElementById('syncStatus');
@@ -573,20 +647,37 @@ function applySheetData(d){
     localStorage.setItem('elf_brands',JSON.stringify(pBrands));
   }catch(e){}
 }
+// JSONP callback for reading from Apps Script (avoids CORS)
+var _jsonpCb=null;
+function _elfCb(data){
+  if(_jsonpCb){_jsonpCb(data); _jsonpCb=null;}
+}
 function pullFromSheets(){
   if(!SCRIPT_URL) return;
   setSyncStatus('loading');
-  fetch(SCRIPT_URL+'?action=read&cb='+Date.now())
-    .then(function(r){return r.json();})
-    .then(function(d){
-      if(d&&d.purchases!==undefined){
-        applySheetData(d);
-        _lastSync=Date.now(); setSyncStatus('saved');
-        setTimeout(function(){setSyncStatus('idle');},2500);
-        loadSettingsUI(); refresh(); renderTable();
-      }
-    })
-    .catch(function(){setSyncStatus('offline');});
+  var cbName='_elfCb';
+  var url=SCRIPT_URL+'?action=read&callback='+cbName+'&cb='+Date.now();
+  var s=document.createElement('script');
+  var done=false;
+  var timer=setTimeout(function(){
+    if(!done){done=true;setSyncStatus('offline');document.head.removeChild(s);}
+  },12000);
+  _jsonpCb=function(d){
+    if(done) return; done=true;
+    clearTimeout(timer);
+    document.head.removeChild(s);
+    if(d&&d.purchases!==undefined){
+      applySheetData(d);
+      _lastSync=Date.now(); setSyncStatus('saved');
+      setTimeout(function(){setSyncStatus('idle');},2500);
+      loadSettingsUI(); refresh(); renderTable();
+    } else {
+      setSyncStatus('error');
+    }
+  };
+  s.src=url;
+  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('offline');}};
+  document.head.appendChild(s);
 }
 function hydrate(){
   try{
@@ -683,7 +774,17 @@ function saveSettings(){
   cfg.defDisp = parseInt(document.getElementById('sDisp').value)||3;
   cfg.alertDays = parseInt(document.getElementById('sAlert').value)||7;
   var su=document.getElementById('sScriptUrl');
-  if(su){SCRIPT_URL=su.value.trim();}
+  if(su){
+    var newUrl=su.value.trim();
+    if(newUrl && newUrl!==SCRIPT_URL){
+      SCRIPT_URL=newUrl;
+      persist();
+      setSyncStatus('loading');
+      setTimeout(pullFromSheets,300);
+      return;
+    }
+    SCRIPT_URL=newUrl;
+  }
   persist();
 }
 function loadSettingsUI(){
@@ -693,10 +794,10 @@ function loadSettingsUI(){
   document.getElementById('sGRN').value = cfg.defGRN;
   document.getElementById('sDisp').value = cfg.defDisp;
   document.getElementById('sAlert').value = cfg.alertDays;
+  var surl=document.getElementById('sScriptUrl'); if(surl) surl.value=SCRIPT_URL||'';
 }
 
 // ====== ALERTS ======
-  var surl=document.getElementById('sScriptUrl'); if(surl) surl.value=SCRIPT_URL||'';
 function getAlerts(){
   var tod = today(), out = [];
   purchases.forEach(function(p, i){
