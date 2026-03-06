@@ -369,7 +369,7 @@ select option{background:#fff;color:var(--tx)}
       <div class="fg"><label>Alert Window (days before target)</label><input id="sAlert" type="number" value="7" min="1" oninput="saveSettings()"></div>
     </div>
   </div>
-  <div class="fg" style="margin-top:16px;max-width:620px"><label>Google Sheets Sync URL <span style="font-weight:400;text-transform:none;font-size:11px;color:#9a50c1">(Apps Script /exec URL - leave blank for local-only mode)</span></label><div style="display:flex;gap:8px;align-items:center"><input type="text" id="sScriptUrl" class="tin" placeholder="https://script.google.com/macros/s/.../exec" style="font-size:12px;flex:1" oninput="saveSettings()"><button class="btn bg bsm" onclick="testConnection()" style="white-space:nowrap;flex-shrink:0">&#128268; Test Connection</button></div><div style="margin-top:5px;font-size:11px;color:#5a2d80">When set, all changes sync to Google Sheets. All users with access to the same sheet see live data.</div></div><div style="margin-top:14px"><button class="btn bd2 bsm" onclick="clearData()">&#9888;&#65039; Master Reset</button></div>
+  <div class="fg" style="margin-top:16px;max-width:620px"><label>Google Sheets Sync URL <span style="font-weight:400;text-transform:none;font-size:11px;color:#9a50c1">(Apps Script /exec URL - leave blank for local-only mode)</span></label><div style="display:flex;gap:8px;align-items:center"><input type="text" id="sScriptUrl" class="tin" placeholder="https://script.google.com/macros/s/.../exec" style="font-size:12px;flex:1" oninput="saveSettings()"><button class="btn bg bsm" onclick="testConnection()" style="white-space:nowrap;flex-shrink:0">&#128268; Test Connection</button></div><div style="margin-top:5px;font-size:11px;color:#5a2d80">When set, all changes sync to Google Sheets. All users with access to the same sheet see live data.</div><div id="syncDiag" style="display:none;margin-top:10px;padding:12px 14px;background:#fff8f0;border:1px solid #f0c080;border-radius:8px;font-size:12px;color:#1a0530;line-height:1.7"></div></div><div style="margin-top:14px"><button class="btn bd2 bsm" onclick="clearData()">&#9888;&#65039; Master Reset</button></div>
 </div>
 
 <!-- PURCHASE ADD/EDIT MODAL -->
@@ -556,7 +556,8 @@ function pushToSheets(){
     }
   }
   if(chunks.length===0){
-    jsonpWrite({purchases:[],cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands},function(){
+    // Empty purchases = intentional clear, hard-wipe sheet
+    jsonpWrite({purchases:[],cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_hardReset:true},function(){
       _syncPending=false; _lastSync=Date.now();
       setSyncStatus('saved'); setTimeout(function(){setSyncStatus('idle');},2500);
     });
@@ -585,27 +586,58 @@ function testConnection(){
   var inp=document.getElementById('sScriptUrl');
   var url=(inp?inp.value.trim():SCRIPT_URL).trim();
   if(!url){ showToast('Paste your Apps Script URL first','err'); return; }
-  SCRIPT_URL=url; inp.value=url;
+  SCRIPT_URL=url; if(inp) inp.value=url;
+  var diag=document.getElementById('syncDiag');
+  if(diag){diag.style.display='block'; diag.innerHTML='<b>Testing...</b> sending request to Apps Script...';}
   setSyncStatus('loading');
   var s=document.createElement('script'), done=false;
   var cb='_testCb_'+Date.now();
   var timer=setTimeout(function(){
-    if(!done){done=true; try{document.head.removeChild(s);}catch(e){}
-    setSyncStatus('error'); showToast('Connection timed out. Check URL & deployment.','err');}
+    if(!done){
+      done=true; try{document.head.removeChild(s);}catch(e){}
+      setSyncStatus('error');
+      if(diag) diag.innerHTML='<b style="color:#c0392b">TIMED OUT (12s)</b><br>The script URL did not respond. Most likely cause:<br>'+
+        '<b>1.</b> Apps Script not deployed as <b>"Anyone"</b> access<br>'+
+        '<b>2.</b> Code.gs not updated to new version<br>'+
+        '<b>3.</b> Wrong URL pasted<br><br>'+
+        '<a href="'+url+'?action=read&callback=test" target="_blank" style="color:#47017e;font-weight:600">Click here to open script URL in new tab</a> '+
+        '(should show JSON data, not a login page)';
+      showToast('Timed out. See diagnostic below.','err');
+    }
   },12000);
   window[cb]=function(d){
     if(done) return; done=true; clearTimeout(timer);
     try{document.head.removeChild(s);}catch(e){}
     if(d && !d.error){
-      setSyncStatus('saved'); showToast('Connected! Syncing data...');
+      setSyncStatus('saved');
+      if(diag) diag.innerHTML='<b style="color:#1a7a4a">Connected!</b> Script is reachable. Syncing data now...';
+      showToast('Connected! Syncing...');
       persist(); setTimeout(pullFromSheets,300);
     } else {
       setSyncStatus('error');
-      showToast('Error: '+(d.error||'Unknown error')+'. Re-deploy script as Anyone.','err');
+      if(diag) diag.innerHTML='<b style="color:#c0392b">Script returned error:</b> '+(d.error||'unknown')+'<br>Re-deploy Code.gs as Web App, access = Anyone.';
+      showToast('Script error. See diagnostic below.','err');
     }
   };
   s.src=url+'?action=read&callback='+cb+'&cb='+Date.now();
-  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('error');showToast('Cannot reach script. Check URL.','err');}}
+  s.onerror=function(){
+    if(!done){
+      done=true; clearTimeout(timer); setSyncStatus('error');
+      if(diag) diag.innerHTML='<b style="color:#c0392b">SCRIPT BLOCKED / NOT FOUND</b><br>'+
+        'The browser could not load the script URL. Most likely causes:<br>'+
+        '<b>1. Wrong access setting</b> \u2014 must be <b>Anyone</b> (not "Anyone with Google account")<br>'+
+        '<b>2. Forgot to create New Version</b> when deploying<br>'+
+        '<b>3. Wrong URL</b> \u2014 must end in <code>/exec</code><br><br>'+
+        '<a href="'+url+'?action=read&callback=test" target="_blank" style="color:#47017e;font-weight:700">'+
+        '&#128279; Open script URL in new tab</a> \u2014 if it asks you to sign in, the access is wrong.<br><br>'+
+        'Correct deployment steps:<br>'+
+        '1. Apps Script \u2192 Deploy \u2192 Manage deployments<br>'+
+        '2. Click pencil (edit) \u2192 Version: <b>New version</b><br>'+
+        '3. Who has access: <b>Anyone</b> (no Google account required)<br>'+
+        '4. Click Deploy \u2192 copy the /exec URL';
+      showToast('Cannot reach script. See diagnostic below.','err');
+    }
+  };
   document.head.appendChild(s);
 }
 function setSyncStatus(state){
@@ -643,6 +675,7 @@ function _elfCb(data){
 }
 function pullFromSheets(){
   if(!SCRIPT_URL) return;
+  if(window._blockPull){ setSyncStatus('idle'); return; }
   setSyncStatus('loading');
   var cbName='_elfCb';
   var url=SCRIPT_URL+'?action=read&callback='+cbName+'&cb='+Date.now();
@@ -818,6 +851,7 @@ function loadSettingsUI(){
 function getAlerts(){
   var tod = today(), out = [];
   purchases.forEach(function(p, i){
+    if(p._deleted) return;
     var lbl = (p.category||'?')+' > '+(p.subcat||'?')+' > '+(p.brand||'?');
     if(p.purchaseTarget){
       var d = diffDays(tod, p.purchaseTarget);
@@ -880,7 +914,7 @@ function renderAlertsTab(){
   var sl=document.getElementById('supPendList');
   if(sl){
     sl.innerHTML='';
-    var supItems=purchases.filter(function(p){return !isSupID(p);});
+    var supItems=purchases.filter(function(p){return !p._deleted&&!isSupID(p);});
     if(!supItems.length){ sl.innerHTML='<div class="ai ok"><div class="atl">\u2705 All brands have supplier details!</div></div>'; }
     else supItems.forEach(function(p,i){
       var lbl=(p.category||'?')+' > '+(p.subcat||'?')+' > '+(p.brand||'?');
@@ -922,10 +956,14 @@ function refresh(){
     '<div class="sc sc-b"><div class="lb">Total Budget</div><div class="vl">'+cur(totBud)+'</div><div class="sb2">Sum of brand budgets</div></div>'+
     '<div class="sc sc-g"><div class="lb">Committed</div><div class="vl">'+cur(comm)+'</div><div class="sb2">Planned spend</div></div>'+
     '<div class="sc '+(rem<0?'sc-r':'sc-b')+'"><div class="lb">Remaining Budget</div><div class="vl">'+cur(rem)+'</div><div class="sb2">'+(rem<0?'Over budget':'Available to spend')+'</div></div>';
-  // Refresh alerts tab if visible
-  if(document.getElementById('page-alerts') && document.getElementById('page-alerts').classList.contains('active')){
-    renderAlertsTab();
-  }
+  // Always recalculate alert counts; only full re-render if tab is open
+  var _ap=document.getElementById('page-alerts');
+  if(_ap&&_ap.classList.contains('active')) renderAlertsTab();
+  // Always update badge count
+  var _alertItems=getAlerts();
+  var _critCount=_alertItems.filter(function(a){return a.type==='red';}).length;
+  var _pip=document.getElementById('alertPip'); if(_pip) _pip.textContent=_critCount;
+
   var ucats = [];
   purchases.forEach(function(p){ if(p.category&&ucats.indexOf(p.category)<0) ucats.push(p.category); });
   var mini = '';
@@ -1681,13 +1719,22 @@ function showPreview(rows,prevId){
 function confirmImport(mode,prevId){
   if(!pendingImport.length) return;
   if(mode==='replace'){
-    purchases=mergeByID(pendingImport,purchases);
+    purchases=pendingImport.slice();
   } else {
-    purchases=mergeByID(purchases,pendingImport);
+    // Append: merge by ID (new wins on conflict)
+    var map={};
+    purchases.forEach(function(p){ if(p._id) map[p._id]=p; });
+    pendingImport.forEach(function(p){ if(p._id) map[p._id]=p; });
+    purchases=Object.keys(map).map(function(k){ return map[k]; });
   }
+  // Assign fresh IDs + timestamps to any missing
+  purchases.forEach(function(p){
+    if(!p._id) p._id=uid();
+    if(!p._modified) p._modified=Date.now();
+  });
   // Rebuild masters fully from all purchases
   pCats=[]; pSubs=[]; pBrands=[];
-  purchases.filter(function(p){return !p._deleted;}).forEach(function(p){
+  purchases.forEach(function(p){
     var c=(p.category||'').trim(),s=(p.subcat||'').trim(),b=(p.brand||'').trim();
     if(c) ensureMaster(c,s||null,b||null);
   });
@@ -1699,17 +1746,28 @@ function confirmImport(mode,prevId){
     localStorage.setItem('elf_subs',JSON.stringify(pSubs));
     localStorage.setItem('elf_brands',JSON.stringify(pBrands));
   }catch(e){}
-  // Force immediate push to Sheets
-  clearTimeout(_syncTimer);
+  // Block pull while we write
+  window._blockPull=true;
   _syncPending=true; setSyncStatus('saving');
-  pushToSheets();
+  clearTimeout(_syncTimer);
+  var total=purchases.length;
+  if(mode==='replace'){
+    // Hard reset sheet first, then write fresh data
+    jsonpWrite({purchases:[],cfg:cfg,pCats:[],pSubs:[],pBrands:[],_hardReset:true},function(){
+      pushToSheets();
+    });
+  } else {
+    pushToSheets();
+  }
+  // Unblock pull after write completes (pushToSheets sets saved status when done)
+  setTimeout(function(){ window._blockPull=false; },20000);
   refresh(); renderTable();
   var mp=document.getElementById('page-master');
   if(mp&&mp.classList.contains('active')) renderMasterTree();
   document.getElementById('pv1').innerHTML='';
   document.getElementById('pv2').innerHTML='';
   document.getElementById('upModal').classList.remove('open');
-  showToast('Imported '+purchases.length+' entries - syncing to Sheets...');
+  showToast('Imported '+total+' entries - syncing to Sheet...');
 }
 // ====== DRAG DROP ======
 function onDov(e,id){ e.preventDefault(); var el=document.getElementById(id); if(el) el.classList.add('drag'); }
@@ -1748,12 +1806,28 @@ function dlImportTpl(){
 var toastTmr;
 function showToast(msg,type){ var el=document.getElementById('toast'); el.textContent=msg; el.className='toast show'+(type==='err'?' err':''); clearTimeout(toastTmr); toastTmr=setTimeout(function(){ el.className='toast'; },2500); }
 function clearData(){
-  if(!confirm('This will permanently delete ALL purchases, categories, sub-categories and brands.\n\nAre you sure you want to perform a Master Reset?')) return;
+  if(!confirm('This will permanently delete ALL purchases, categories, sub-categories and brands. This will also clear the Google Sheet.\n\nAre you sure?')) return;
   purchases=[]; pCats=[]; pSubs=[]; pBrands=[];
-  try{ localStorage.removeItem('elf_p'); localStorage.removeItem('elf_cats'); localStorage.removeItem('elf_subs'); localStorage.removeItem('elf_brands'); }catch(e){}
-  persist(); refresh(); renderTable();
-  if(typeof renderMasterTree==='function') renderMasterTree();
-  showToast('Master reset complete.');
+  try{
+    localStorage.removeItem('elf_p');
+    localStorage.removeItem('elf_cats');
+    localStorage.removeItem('elf_subs');
+    localStorage.removeItem('elf_brands');
+  }catch(e){}
+  // Block auto-pull so sheet data doesn't come back
+  window._blockPull = true;
+  refresh(); renderTable(); renderMasterTree();
+  // Hard-wipe the sheet (bypass serverMerge)
+  if(SCRIPT_URL){
+    setSyncStatus('saving');
+    jsonpWrite({purchases:[],cfg:cfg,pCats:[],pSubs:[],pBrands:[],_hardReset:true},function(){
+      setSyncStatus('saved');
+      setTimeout(function(){ setSyncStatus('idle'); window._blockPull=false; },3000);
+      showToast('Master reset complete. Sheet cleared.');
+    });
+  } else {
+    showToast('Master reset complete.');
+  }
 }
 
 // ====== SAMPLE DATA ======
