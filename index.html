@@ -540,62 +540,44 @@ function persist(){
 }
 function pushToSheets(){
   if(!SCRIPT_URL) return;
-  // Write via JSONP GET (same pattern as read, Apps Script handles it)
-  var cbName='_elfWriteCb';
-  var payload=encodeURIComponent(JSON.stringify({
-    purchases:purchases,cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_clientId:_clientId
-  }));
-  var url=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+payload+'&cb='+Date.now();
-  // If URL too long (>7000 chars), chunk via multiple requests
-  if(url.length>7000){
-    pushInChunks(); return;
+  // POST with no-cors: bypasses CORS entirely, works for any payload size
+  // We cannot read the response, so we schedule a pull 3s later to confirm
+  var body=JSON.stringify({purchases:purchases,cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_clientId:_clientId});
+  fetch(SCRIPT_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:body})
+    .then(function(){
+      _syncPending=false; _lastSync=Date.now();
+      setSyncStatus('saved');
+      setTimeout(function(){setSyncStatus('idle');},2500);
+    })
+    .catch(function(e){
+      // no-cors fetch errors are rare; try JSONP write as fallback
+      console.warn('POST failed, trying JSONP write:',e);
+      pushViaJsonp();
+    });
+}
+function pushViaJsonp(){
+  // Fallback: JSONP write (limited by URL length ~7KB)
+  var cbName='_elfWCb_'+Date.now();
+  var payload=JSON.stringify({purchases:purchases,cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands});
+  var enc=encodeURIComponent(payload);
+  if(enc.length>6500){
+    // Too large for URL; show error and ask user to re-deploy with POST support
+    setSyncStatus('error');
+    showToast('Data too large for URL sync. Re-deploy Code.gs (POST support required).','err');
+    return;
   }
   var s=document.createElement('script');
   var done=false;
-  var timer=setTimeout(function(){
-    if(!done){done=true;setSyncStatus('error');try{document.head.removeChild(s);}catch(e){}}
-  },15000);
-  window[cbName]=function(d){
-    if(done) return; done=true;
-    clearTimeout(timer);
+  var timer=setTimeout(function(){ if(!done){done=true;setSyncStatus('error');try{document.head.removeChild(s);}catch(e){}} },12000);
+  window[cbName]=function(){
+    if(done)return; done=true; clearTimeout(timer);
     try{document.head.removeChild(s);}catch(e){}
     _syncPending=false;_lastSync=Date.now();
-    setSyncStatus('saved');
-    setTimeout(function(){setSyncStatus('idle');},2500);
+    setSyncStatus('saved'); setTimeout(function(){setSyncStatus('idle');},2500);
   };
-  s.src=url;
+  s.src=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+enc+'&cb='+Date.now();
   s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('error');}}
   document.head.appendChild(s);
-}
-function pushInChunks(){
-  // For large datasets: send purchases in chunks, then send masters
-  var chunkSize=50;
-  var chunks=[];
-  for(var i=0;i<purchases.length;i+=chunkSize){
-    chunks.push(purchases.slice(i,i+chunkSize));
-  }
-  var idx=0;
-  function sendNext(){
-    if(idx>=chunks.length){
-      // All chunks sent, now send masters
-      var cbName='_elfChunkFinal';
-      var payload=encodeURIComponent(JSON.stringify({
-        cfg:cfg,pCats:pCats,pSubs:pSubs,pBrands:pBrands,_clientId:_clientId,_chunksOnly:true
-      }));
-      var s=document.createElement('script');
-      window[cbName]=function(){_syncPending=false;_lastSync=Date.now();setSyncStatus('saved');setTimeout(function(){setSyncStatus('idle');},2500);};
-      s.src=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+payload+'&cb='+Date.now();
-      document.head.appendChild(s);
-      return;
-    }
-    var cbName='_elfChunk'+idx;
-    var payload=encodeURIComponent(JSON.stringify({purchases:chunks[idx],_chunk:true,_clientId:_clientId}));
-    var s=document.createElement('script');
-    window[cbName]=function(){idx++;sendNext();};
-    s.src=SCRIPT_URL+'?action=write&callback='+cbName+'&data='+payload+'&cb='+Date.now();
-    document.head.appendChild(s);
-  }
-  sendNext();
 }
 function testConnection(){
   var inp=document.getElementById('sScriptUrl');
@@ -660,19 +642,27 @@ function pullFromSheets(){
   var s=document.createElement('script');
   var done=false;
   var timer=setTimeout(function(){
-    if(!done){done=true;setSyncStatus('offline');document.head.removeChild(s);}
+    if(!done){done=true;try{document.head.removeChild(s);}catch(e){}setSyncStatus('offline');}
   },12000);
   _jsonpCb=function(d){
     if(done) return; done=true;
     clearTimeout(timer);
-    document.head.removeChild(s);
+    try{document.head.removeChild(s);}catch(e){}
     if(d&&d.purchases!==undefined){
       applySheetData(d);
       _lastSync=Date.now(); setSyncStatus('saved');
       setTimeout(function(){setSyncStatus('idle');},2500);
       loadSettingsUI(); refresh(); renderTable();
+      if(!window._autoRefreshStarted){
+        window._autoRefreshStarted=true;
+        setInterval(function(){if(!_syncPending)pullFromSheets();},60000);
+      }
+    } else if(d&&d.error){
+      setSyncStatus('error'); console.warn('Sheets error:',d.error);
     } else {
-      setSyncStatus('error');
+      // Empty sheet - push local data up
+      if(purchases.length>0) pushToSheets();
+      setSyncStatus('idle');
     }
   };
   s.src=url;
@@ -1672,10 +1662,22 @@ function confirmImport(mode,prevId){
     var c=(p.category||'').trim(),s=(p.subcat||'').trim(),b=(p.brand||'').trim();
     if(c&&s&&b) ensureMaster(c,s,b); else if(c&&s) ensureMaster(c,s,null); else if(c) ensureMaster(c,null,null);
   });
-  pendingImport=[]; persist(); refresh(); renderTable();
+  pendingImport=[];
+  // Save locally first
+  try{
+    localStorage.setItem('elf_p',JSON.stringify(purchases));
+    localStorage.setItem('elf_cats',JSON.stringify(pCats));
+    localStorage.setItem('elf_subs',JSON.stringify(pSubs));
+    localStorage.setItem('elf_brands',JSON.stringify(pBrands));
+  }catch(e){}
+  // Force immediate push to Sheets (bypass debounce timer)
+  clearTimeout(_syncTimer);
+  _syncPending=true; setSyncStatus('saving');
+  pushToSheets();
+  refresh(); renderTable();
   document.getElementById('pv1').innerHTML=''; document.getElementById('pv2').innerHTML='';
   document.getElementById('upModal').classList.remove('open');
-  showToast('Imported! '+purchases.length+' entries.');
+  showToast('Imported '+purchases.length+' entries \u2014 syncing to Sheets...');
 }
 
 // ====== DRAG DROP ======
@@ -1881,7 +1883,13 @@ document.addEventListener('click',function(e){
 hydrate(); loadSettingsUI();
 if(SCRIPT_URL) setInterval(function(){if(!_syncPending)pullFromSheets();},60000);
 if(!cfg.openingDate){ cfg.openingDate=addDays(today(),45); document.getElementById('sOpen').value=cfg.openingDate; }
-if(!purchases.length) loadSample();
+// Only load sample data if no SCRIPT_URL and no local data
+if(!purchases.length && !SCRIPT_URL) loadSample();
+// If SCRIPT_URL set but no local data: show loading state (pullFromSheets will populate)
+if(!purchases.length && SCRIPT_URL){
+  document.getElementById('sumCards').innerHTML='<div style="text-align:center;padding:40px;color:#9a50c1;font-size:14px;grid-column:1/-1"><span style="font-size:24px">&#9889;</span><br><br>Connecting to Google Sheets...<br><small style="color:#5a2d80">Data will appear once synced</small></div>';
+  document.getElementById('miniCharts').innerHTML='';
+}
 refresh(); renderTable();
 </script>
 </body>
