@@ -620,6 +620,16 @@ function testConnection(){
       showToast('Script error. See diagnostic below.','err');
     }
   };
+  // Try fetch first, fall back to script tag
+  fetch(url+'?action=read&cb='+Date.now(),{method:'GET',mode:'cors',credentials:'omit'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(done)return; done=true; clearTimeout(timer);
+      try{document.head.removeChild(s);}catch(e){}
+      if(d&&!d.error){ setSyncStatus('saved'); if(diag) diag.innerHTML='<b style="color:#1a7a4a">Connected!</b> Script reachable via fetch. Syncing...'; showToast('Connected!'); persist(); setTimeout(pullFromSheets,300); }
+      else { setSyncStatus('error'); if(diag) diag.innerHTML='<b style="color:#c0392b">Error:</b> '+(d&&d.error||'unknown'); }
+    })
+    .catch(function(){ /* fetch failed, script tag already appended as fallback */ });
   s.src=url+'?action=read&callback='+cb+'&cb='+Date.now();
   s.onerror=function(){
     if(!done){
@@ -678,6 +688,28 @@ function pullFromSheets(){
   if(!SCRIPT_URL) return;
   if(window._blockPull){ setSyncStatus('idle'); return; }
   setSyncStatus('loading');
+  // Try fetch() first - works in all modern browsers without JSONP script injection
+  var fetchUrl=SCRIPT_URL+'?action=read&cb='+Date.now();
+  var fetchDone=false;
+  var fetchTimer=setTimeout(function(){
+    if(!fetchDone){ fetchDone=true; pullViaJsonp(); } // fetch timed out, try JSONP
+  },8000);
+  fetch(fetchUrl,{method:'GET',mode:'cors',credentials:'omit'})
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      return r.json();
+    })
+    .then(function(d){
+      if(fetchDone) return; fetchDone=true; clearTimeout(fetchTimer);
+      onPullSuccess(d);
+    })
+    .catch(function(err){
+      if(fetchDone) return; fetchDone=true; clearTimeout(fetchTimer);
+      console.log('fetch failed, trying JSONP:',err.message);
+      pullViaJsonp(); // fall back to JSONP
+    });
+}
+function pullViaJsonp(){
   var cbName='_elfCb';
   var url=SCRIPT_URL+'?action=read&callback='+cbName+'&cb='+Date.now();
   var s=document.createElement('script');
@@ -689,26 +721,28 @@ function pullFromSheets(){
     if(done) return; done=true;
     clearTimeout(timer);
     try{document.head.removeChild(s);}catch(e){}
-    if(d&&d.purchases!==undefined){
-      applySheetData(d);
-      _lastSync=Date.now(); setSyncStatus('saved');
-      setTimeout(function(){setSyncStatus('idle');},2500);
-      loadSettingsUI(); refresh(); renderTable();
-      if(!window._autoRefreshStarted){
-        window._autoRefreshStarted=true;
-        setInterval(function(){if(!_syncPending)pullFromSheets();},60000);
-      }
-    } else if(d&&d.error){
-      setSyncStatus('error'); console.warn('Sheets error:',d.error);
-    } else {
-      // Empty sheet - push local data up
-      if(purchases.length>0) pushToSheets();
-      setSyncStatus('idle');
-    }
+    onPullSuccess(d);
   };
   s.src=url;
-  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('offline');}};
+  s.onerror=function(){if(!done){done=true;clearTimeout(timer);setSyncStatus('offline');showToast('Cannot reach Google Sheet on this device. Check network.','err');}};
   document.head.appendChild(s);
+}
+function onPullSuccess(d){
+  if(d&&d.purchases!==undefined){
+    applySheetData(d);
+    _lastSync=Date.now(); setSyncStatus('saved');
+    setTimeout(function(){setSyncStatus('idle');},2500);
+    loadSettingsUI(); refresh(); renderTable();
+    if(!window._autoRefreshStarted){
+      window._autoRefreshStarted=true;
+      setInterval(function(){if(!_syncPending)pullFromSheets();},60000);
+    }
+  } else if(d&&d.error){
+    setSyncStatus('error'); console.warn('Sheets error:',d.error);
+  } else {
+    if(purchases.length>0) pushToSheets();
+    setSyncStatus('idle');
+  }
 }
 function hydrate(){
   try{
