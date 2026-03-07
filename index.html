@@ -485,6 +485,7 @@ select option{background:#fff;color:var(--tx)}
 <script>
 // ====== SHEETS CONFIG ======
 var SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwv9q_XxxbeTFos7utT0T_gNvfYT4xBT9P_PjGDliW4KVqR3HXeK_bRlDvSfpQpJRTU/exec';
+var SCRIPT_URL_DEFAULT = SCRIPT_URL; // always restore from this
 var _syncTimer=null, _lastSync=0, _syncPending=false;
 var _clientId='cli_'+Math.random().toString(36).substr(2,8);
 
@@ -531,7 +532,7 @@ function persist(){
     localStorage.setItem('elf_cats',JSON.stringify(pCats));
     localStorage.setItem('elf_subs',JSON.stringify(pSubs));
     localStorage.setItem('elf_brands',JSON.stringify(pBrands));
-    localStorage.setItem('elf_su',SCRIPT_URL||'');
+    // SCRIPT_URL is hardcoded - no need to save to localStorage
   }catch(e){}
   if(!SCRIPT_URL) return;
   _syncPending=true; setSyncStatus('saving');
@@ -719,8 +720,10 @@ function hydrate(){
     if(ca) pCats=JSON.parse(ca);
     if(sb) pSubs=JSON.parse(sb);
     if(br) pBrands=JSON.parse(br);
-    if(su) SCRIPT_URL=su;
-  }catch(e){}
+    // Never override hardcoded URL from localStorage - use default if localStorage is empty/wrong
+    if(su && su.indexOf('script.google.com')>=0) SCRIPT_URL=su;
+    else SCRIPT_URL=SCRIPT_URL_DEFAULT;
+  }catch(e){ SCRIPT_URL=SCRIPT_URL_DEFAULT; }
   ensureIds();
   if(SCRIPT_URL) pullFromSheets();
 }
@@ -808,7 +811,7 @@ function saveSettings(){
   if(su){
     var newUrl=su.value.trim();
     if(newUrl && newUrl!==SCRIPT_URL){
-      SCRIPT_URL=newUrl;
+      SCRIPT_URL=newUrl; SCRIPT_URL_DEFAULT=newUrl;
       persist();
       setSyncStatus('loading');
       setTimeout(pullFromSheets,300);
